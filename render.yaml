@@ -1,0 +1,23 @@
+# Render Blueprint: free web service. SQLite lives on the instance's disk,
+# which is reset on each deploy or restart; the demo account is rebuilt at boot.
+services:
+  - type: web
+    name: finwise
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
