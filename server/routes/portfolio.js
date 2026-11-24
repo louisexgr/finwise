@@ -2,6 +2,7 @@ import { Router } from "express";
 import { getHoldings, getTransactions, runOrderTx, findUserById } from "../db.js";
 import { requireAuth } from "../middleware/auth.js";
 import { getQuotes, getQuote, getProfile, getSparkline } from "../services/market.js";
+import { getDerivativesPositions } from "../services/derivatives.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -24,11 +25,17 @@ router.get("/", async (req, res) => {
     };
   });
   const invested = positions.reduce((s, p) => s + p.value, 0);
+  // Options at model value + futures at margin ± P&L (what closing would return)
+  const deriv = await getDerivativesPositions(req.userId);
+  const derivativesValue = deriv.options.reduce((s, o) => s + o.value, 0)
+    + deriv.futures.reduce((s, f) => s + Math.max(f.equity, 0), 0);
+  const cash = deriv.cash; // may have changed if something just settled
   res.json({
     positions,
-    cash: user.cash,
+    cash,
     invested: +invested.toFixed(2),
-    total: +(invested + user.cash).toFixed(2),
+    derivativesValue: +derivativesValue.toFixed(2),
+    total: +(invested + cash + derivativesValue).toFixed(2),
     transactions: getTransactions.all(req.userId),
   });
 });

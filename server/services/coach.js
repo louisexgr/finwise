@@ -1,5 +1,5 @@
 /**
- * Finwise coach — Claude with tools.
+ * Finwise coach — LLM with tools (Anthropic Messages API).
  *
  * The coach can read the user's portfolio, budget, quotes and news through
  * tools that call the same server-side code as the rest of the app. It can
@@ -13,6 +13,9 @@ import { getHoldings, findUserById, getBudget, getPlan, getDeposits } from "../d
 import { getQuote, getQuotes, getProfile, searchSymbols } from "./market.js";
 import { getMarketNews, NEWS_CATEGORIES } from "./news.js";
 import { analyzePortfolio } from "./agent.js";
+import {
+  getOptionChain, getDerivativesPositions, previewOptionOrder, previewFutureOrder, listExpiries,
+} from "./derivatives.js";
 
 export const COACH_MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-5-5";
 const MAX_TOOL_ROUNDS = 6;
@@ -155,6 +158,54 @@ const TOOLS = [
       required: ["symbol", "side", "qty", "reason"], additionalProperties: false,
     },
   },
+  {
+    name: "get_option_chain",
+    description: "Returns the option chain of an underlying for one expiry: spot price, implied volatility, contract size, and for 7 strikes around the spot the Black-Scholes price and Greeks (delta, gamma, theta per day, vega per vol point) of the call and the put. Prices are per unit of underlying.",
+    input_schema: {
+      type: "object",
+      properties: {
+        symbol: { type: "string" },
+        expiry: { type: "string", description: "YYYY-MM-DD, one of the listed expiries; empty string for the default (about 30 days)" },
+      },
+      required: ["symbol", "expiry"], additionalProperties: false,
+    },
+  },
+  {
+    name: "get_derivatives_positions",
+    description: "Returns the user's open options (value, P&L, delta, theta for the whole position, days left) and futures (side, entry and current price, margin, P&L, leverage, margin-call price).",
+    input_schema: { type: "object", properties: {}, required: [], additionalProperties: false },
+  },
+  {
+    name: "propose_option_order",
+    description: "Proposes buying or selling (closing) SIMULATED option contracts. Long options only: selling means closing contracts the user holds. Nothing is executed: the user confirms on a card. Returns premium, total cost, break-even, max loss and Greeks, or an error.",
+    input_schema: {
+      type: "object",
+      properties: {
+        underlying: { type: "string" },
+        type: { type: "string", enum: ["call", "put"] },
+        strike: { type: "number" },
+        expiry: { type: "string", description: "YYYY-MM-DD, must be one of the listed expiries" },
+        contracts: { type: "integer" },
+        side: { type: "string", enum: ["buy", "sell"] },
+        reason: { type: "string" },
+      },
+      required: ["underlying", "type", "strike", "expiry", "contracts", "side", "reason"], additionalProperties: false,
+    },
+  },
+  {
+    name: "propose_future_order",
+    description: "Proposes opening a SIMULATED futures position (long or short) with 10% initial margin. Nothing is executed: the user confirms on a card. Returns futures price, exposure, margin, P&L per 1% move and the margin-call price, or an error.",
+    input_schema: {
+      type: "object",
+      properties: {
+        underlying: { type: "string" },
+        side: { type: "string", enum: ["long", "short"] },
+        qty: { type: "number", description: "Units of underlying" },
+        reason: { type: "string" },
+      },
+      required: ["underlying", "side", "qty", "reason"], additionalProperties: false,
+    },
+  },
 ].map(t => ({ ...t, strict: true }));
 
 async function runTool(name, input, ctx) {
@@ -198,6 +249,30 @@ async function runTool(name, input, ctx) {
       }
       return out;
     }
+    case "get_option_chain": {
+      const chain = await getOptionChain(input.symbol, input.expiry || undefined);
+      return chain;
+    }
+    case "get_derivatives_positions": {
+      const { options, futures, events } = await getDerivativesPositions(ctx.userId);
+      return { options, futures, settledJustNow: events };
+    }
+    case "propose_option_order": {
+      const out = await previewOptionOrder(ctx.userId, input);
+      if (out.proposal) {
+        ctx.proposals.push({ ...out.proposal, reason: String(input.reason || "").slice(0, 300) });
+        return { ...out.proposal, status: "shown_to_user_for_confirmation" };
+      }
+      return out;
+    }
+    case "propose_future_order": {
+      const out = await previewFutureOrder(ctx.userId, input);
+      if (out.proposal) {
+        ctx.proposals.push({ ...out.proposal, reason: String(input.reason || "").slice(0, 300) });
+        return { ...out.proposal, status: "shown_to_user_for_confirmation" };
+      }
+      return out;
+    }
     default:
       return { error: "UNKNOWN_TOOL" };
   }
@@ -212,7 +287,8 @@ What you do:
 - Analyse the user's simulated portfolio (diversification, concentration, risk in dollars, gains and losses) and their monthly budget (how much goes to housing, daily life, subscriptions, investing, and what is left).
 - Explain financial news in plain words: what happened, why it matters, and which of the user's holdings it may affect.
 - Teach concepts when useful: diversification, volatility, DCA, compound interest, ETFs, bonds, crypto, fees, time horizon, emergency fund.
-- Propose simulated buy or sell orders with the propose_order tool when the user asks for an order or agrees to one. The user confirms or cancels on a card; never say an order was executed.
+- Explain derivatives on the user's real positions: options (calls, puts, strike, expiry, premium, break-even, Black-Scholes, the Greeks: delta, gamma, theta, vega) and futures (long, short, margin, leverage, mark-to-market, margin calls). Use the option chain and positions tools, and give concrete scenarios ("if AAPL drops 10%, your put gains about $X"). Point out that a long option can lose 100% of its premium and that futures leverage multiplies losses.
+- Propose simulated orders when the user asks for one or agrees to one: propose_order for stocks, ETFs, bonds and crypto, propose_option_order for options, propose_future_order for futures. The user confirms or cancels on a card; never say an order was executed.
 
 How you work:
 - Use the tools to get real numbers before talking about the portfolio, the budget, a price or the news. Never invent numbers, prices or headlines.

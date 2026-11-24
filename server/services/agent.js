@@ -2,7 +2,7 @@
  * Finwise coach — deterministic part.
  *  - analyzePortfolio(): deterministic analysis (source of truth): concentration,
  *    breakdown by sector / country / asset class, risk quantified in dollars.
- *  - agentReply(): Claude with tools (services/coach.js) when ANTHROPIC_API_KEY
+ *  - agentReply(): LLM coach with tools (services/coach.js) when ANTHROPIC_API_KEY
  *    is set; otherwise a free rules engine (demo mode) that still analyses the
  *    portfolio and budget, proposes simulated orders and summarises the news.
  */
@@ -10,6 +10,7 @@ import { coachEnabled, coachReply, buildAnalysis, buildBudgetSummary, buildOrder
 import { getMarketNews } from "./news.js";
 import { getHoldings } from "../db.js";
 import { KNOWN_ASSETS } from "./market.js";
+import { previewOptionOrder, previewFutureOrder, listExpiries, getDerivativesPositions } from "./derivatives.js";
 
 const SECTOR_THRESHOLD = 50;
 const CORRECTION_SCENARIO = 0.20;
@@ -85,6 +86,10 @@ const fmt = n => "$" + (+n).toLocaleString("en-US", { maximumFractionDigits: 0 }
 
 /** Each rule: keywords (regex) + response generator anchored to the analysis. */
 const RULES = [
+  {
+    re: /(greek|delta|gamma|theta|vega|black.?scholes|implied vol)/i,
+    fn: () => `Option prices in Finwise come from the Black-Scholes model, which uses five inputs: the underlying's price, the strike, the time left, the volatility and the interest rate. The Greeks tell you how the price reacts: delta is the change for a $1 move in the underlying (a call with delta 0.55 gains about $0.55 per unit), gamma is how fast delta itself changes, theta is the value you lose each day just from time passing, and vega is the change for 1 point of volatility. Buying options means theta works against you: you need the move to happen before expiry.`,
+  },
   {
     re: /(risk|loss|crash|correction|danger|losing|lose)/i,
     fn: a => {
@@ -325,6 +330,48 @@ function findTicker(word) {
   return asset ? asset.symbol : w;
 }
 
+const OPTION_RE = /\b(buy|sell)\s+(\d+)\s+([a-z0-9.\-]{1,12})\s+(\d+(?:\.\d+)?)\s*(call|put)s?\b/i;
+const FUTURE_RE = /\b(long|short)\s+(\d+(?:[.,]\d+)?)\s+([a-z0-9.\-]{1,12})\b/i;
+
+async function optionOrderReply(m, userId) {
+  const expiry = listExpiries()[1];
+  const out = await previewOptionOrder(userId, {
+    underlying: findTicker(m[3]), type: m[5].toLowerCase(), strike: +m[4], expiry, contracts: +m[2], side: m[1].toLowerCase(),
+  });
+  if (!out.proposal) {
+    const why = { INSUFFICIENT_CASH: `the premium would be about ${fmt(out.estimatedTotal)} and you have ${fmt(out.cash)} in cash`, INSUFFICIENT_CONTRACTS: "you don't hold that many contracts", SYMBOL_NOT_FOUND: "I can't find that ticker" }[out.error] || "the order looks invalid";
+    return { reply: `I can't prepare that option order: ${why}. The Derivatives tab shows the available strikes.`, proposals: [] };
+  }
+  const p = { ...out.proposal, reason: "Requested in the chat" };
+  return {
+    reply: `Here is the simulated option: ${p.side} ${p.contracts} ${p.underlying} ${p.strike} ${p.type} expiring ${p.expiry}, at about $${p.premium.toFixed(2)} per unit × ${p.multiplier} = ${fmt(p.estimatedTotal)}. Break-even at expiry: $${p.breakeven.toFixed(2)}.${p.side === "buy" ? ` The most you can lose is the premium, ${fmt(p.estimatedTotal)}.` : ""} Confirm on the card if it's what you want.`,
+    proposals: [p],
+  };
+}
+
+async function futureOrderReply(m, userId) {
+  const out = await previewFutureOrder(userId, { underlying: findTicker(m[3]), side: m[1].toLowerCase(), qty: parseFloat(m[2].replace(",", ".")) });
+  if (!out.proposal) {
+    const why = out.error === "INSUFFICIENT_CASH" ? `the margin would be ${fmt(out.marginRequired)} and you have ${fmt(out.cash)} in cash` : "the order looks invalid";
+    return { reply: `I can't prepare that future: ${why}.`, proposals: [] };
+  }
+  const p = { ...out.proposal, reason: "Requested in the chat" };
+  return {
+    reply: `Here is the simulated future: ${p.side} ${p.qty} ${p.underlying} at about ${fmt(p.futurePrice)}, an exposure of ${fmt(p.notional)} for a margin of only ${fmt(p.margin)} (10× leverage). Each 1% move is about ${fmt(Math.abs(p.pnlPer1Pct))} for or against you, and the position is closed automatically if the price reaches ${fmt(p.liquidationPrice)}. Confirm on the card if you want it.`,
+    proposals: [p],
+  };
+}
+
+async function derivativesReply(userId) {
+  const { options, futures } = await getDerivativesPositions(userId);
+  if (!options.length && !futures.length) return "You don't hold any options or futures yet. Open the Derivatives tab to see an option chain, or ask me something like \"buy 1 AAPL 240 call\" or \"short 5 NVDA\".";
+  const lines = [
+    ...options.map(o => `• ${o.label}: worth ${fmt(o.value)} (${o.pnl >= 0 ? "+" : ""}${fmt(o.pnl)}), ${o.daysToExpiry} days left, time decay ${fmt(Math.abs(o.theta))} a day.`),
+    ...futures.map(f => `• ${f.side} ${f.qty} ${f.underlying} future: ${f.pnl >= 0 ? "+" : ""}${fmt(f.pnl)} on a ${fmt(f.margin)} margin, margin call at ${fmt(f.liquidationPrice)}.`),
+  ];
+  return `Your derivatives:\n${lines.join("\n")}`;
+}
+
 async function orderReply(match, userId) {
   const side = match[1].toLowerCase();
   const qty = parseFloat(match[2].replace(",", "."));
@@ -369,7 +416,7 @@ async function newsReply(userId) {
     const mine = (n.relatedSymbols || []).map(r => r.symbol ?? r).filter(s => heldSet.has(s));
     return `• ${n.headline}${mine.length ? ` (you hold ${mine.join(", ")})` : ""}`;
   });
-  return `Here are the latest headlines:\n${bullets.join("\n")}\n\nOpen one in the News tab and press "Ask the coach" for a plain-words explanation. In demo mode my explanations stay general; with the Claude API connected I read each article and link it to your positions.`;
+  return `Here are the latest headlines:\n${bullets.join("\n")}\n\nOpen one in the News tab and press "Ask the coach" for a plain-words explanation. In demo mode my explanations stay general; with the AI engine connected I read each article and link it to your positions.`;
 }
 
 async function explainNewsReply(message, userId) {
@@ -390,7 +437,7 @@ async function explainNewsReply(message, userId) {
 }
 
 /**
- * Engine priority: Claude coach (tools) > rules. A Claude failure falls back to rules.
+ * Engine priority: LLM coach (tools) > rules. An API failure falls back to rules.
  * @returns {Promise<{reply:string, engine:string, proposals:object[]}>}
  */
 // Budget guard for a public demo: past these daily caps the coach answers in
@@ -413,12 +460,19 @@ export async function agentReply(message, history, userId) {
       const { reply, proposals } = await coachReply(message, history, { userId });
       return { reply, proposals, engine: "claude" };
     } catch (e) {
-      console.error("Claude API error, falling back to rules:", e.status || "", e.message);
+      console.error("AI coach API error, falling back to rules:", e.status || "", e.message);
     }
   }
   const m = message.toLowerCase();
   if (m.startsWith("explain this news")) {
     return { reply: await explainNewsReply(message, userId), proposals: [], engine: "rules" };
+  }
+  const optOrder = message.match(OPTION_RE);
+  if (optOrder) return { ...(await optionOrderReply(optOrder, userId)), engine: "rules" };
+  const futOrder = message.match(FUTURE_RE);
+  if (futOrder) return { ...(await futureOrderReply(futOrder, userId)), engine: "rules" };
+  if (/(my (options|futures|derivatives)|derivatives? positions?)/.test(m)) {
+    return { reply: await derivativesReply(userId), proposals: [], engine: "rules" };
   }
   const order = message.match(ORDER_RE);
   if (order) return { ...(await orderReply(order, userId)), engine: "rules" };

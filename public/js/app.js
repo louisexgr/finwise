@@ -18,6 +18,7 @@ const State = {
   view: "dashboard",
   breakdownView: "sector",  // 'sector' | 'country'
   trade: { symbol: null, side: "buy", qty: 1, amount: 100, inputMode: "qty", detail: null },
+  deriv: { symbol: "AAPL", tab: "options", expiry: null, chain: null, sel: null, contracts: 1, fSide: "long", fQty: 5, meta: null },
   newsCategory: "all",
   newsSymbolFilter: "all",
   newsSearchQuery: "",
@@ -213,6 +214,7 @@ const icon = {
   check: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M8.5 12.5l2.3 2.3L15.5 10"/></svg>`,
   user: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="8.5" r="3.5"/><path d="M5 20c1.5-3.5 4.2-5 7-5s5.5 1.5 7 5"/></svg>`,
   admin: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M8 9h8M8 12.5h8M8 16h4"/></svg>`,
+  deriv: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 20h18"/><path d="M4 16c3 0 4-9 8-9s5 9 8 9"/><path d="M12 7V3"/></svg>`,
   refresh: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 4v5h-5"/></svg>`,
 };
 
@@ -572,6 +574,7 @@ const VIEWS = [
   { id: "dashboard", label: "Dashboard", eyebrow: "Overview", title: "Dashboard", subtitle: "Your simulated wealth — sector by sector, country by country.", icon: icon.home },
   { id: "budget", label: "Budget", eyebrow: "Income & deposits", title: "Budget", subtitle: "Where the money comes from, where it goes — and what you invest.", icon: icon.budget },
   { id: "trading", label: "Invest", eyebrow: "Place an order", title: "Trading", subtitle: "Buy and sell on real prices without risking a single penny.", icon: icon.trade },
+  { id: "derivatives", label: "Derivatives", eyebrow: "Options & futures", title: "Derivatives", subtitle: "Options priced with Black-Scholes and leveraged futures, on the same underlyings.", icon: icon.deriv },
   { id: "news", label: "News", eyebrow: "Filtered feed", title: "News Feed", subtitle: "Only financial news concerning your positions and markets.", icon: icon.news },
   { id: "agent", label: "AI Coach", eyebrow: "Assistant", title: "AI Coach", subtitle: "Analyses your portfolio and budget, explains the news, prepares simulated orders.", icon: icon.agent },
   { id: "risk", label: "Risks", eyebrow: "Before investing", title: "Understand Risks", subtitle: "Key concepts illustrated with your own portfolio.", icon: icon.shield },
@@ -662,7 +665,7 @@ function navigate(viewId) {
   $("#nav").querySelectorAll("[data-nav]").forEach(b =>
     b.addEventListener("click", () => navigate(b.dataset.nav)));
   ({
-    dashboard: renderDashboard, budget: renderBudget, trading: renderTrading,
+    dashboard: renderDashboard, budget: renderBudget, trading: renderTrading, derivatives: renderDerivatives,
     news: renderNews, agent: renderAgent, risk: renderRisk,
     account: renderAccount, admin: renderAdmin,
   }[viewId])();
@@ -710,7 +713,7 @@ async function pollQuotes() {
       p.pnl = +((q.price - p.avg_cost) * p.shares).toFixed(2);
     }
     State.portfolio.invested = +State.portfolio.positions.reduce((s, p) => s + p.value, 0).toFixed(2);
-    State.portfolio.total = +(State.portfolio.invested + State.portfolio.cash).toFixed(2);
+    State.portfolio.total = +(State.portfolio.invested + State.portfolio.cash + (State.portfolio.derivativesValue || 0)).toFixed(2);
     if (State.trade.detail && quotes[State.trade.detail.symbol]) {
       Object.assign(State.trade.detail, quotes[State.trade.detail.symbol]);
     }
@@ -795,6 +798,7 @@ function renderDashboard() {
         <div class="hero-delta">
           <span class="tag ${delta >= 0 ? "positive" : "negative"}">${fmtPct(deltaPct)}</span>
           <span class="mono" style="color:var(--text-secondary)">${delta >= 0 ? "+" : ""}${fmtEur(delta)} vs total deposited</span>
+          ${pf.derivativesValue ? `<span class="mono" style="color:var(--text-tertiary);display:block;margin-top:4px;font-size:12px;">incl. ${fmtEur(pf.derivativesValue)} in options & futures</span>` : ""}
         </div>
         <div class="hero-sub"><span class="live-dot"></span>Prices updated every 15s · Total deposited: ${fmtEur(deposited)}</div>
       </div>
@@ -1340,6 +1344,316 @@ async function placeOrder() {
   }
 }
 
+/* ========================================================== DERIVATIVES = */
+const fmtNum = (n, d = 2) => (+n).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+const signed = (n, d = 0) => (n >= 0 ? "+" : "−") + fmtEur(Math.abs(n), d);
+
+async function renderDerivatives() {
+  const D = State.deriv;
+  if (!D.meta) {
+    try { D.meta = await API.get("/api/derivatives/meta"); } catch { D.meta = { underlyings: [], expiries: [] }; }
+  }
+  $("#view-root").innerHTML = `<div class="view">
+    <div class="card deriv-top">
+      <div class="deriv-pick">
+        <label class="tiny-label" for="dv-under">Underlying</label>
+        <select id="dv-under">${D.meta.underlyings.map(u =>
+          `<option value="${esc(u.symbol)}" ${u.symbol === D.symbol ? "selected" : ""}>${esc(u.symbol)} · ${esc(u.name)}</option>`).join("")}</select>
+      </div>
+      <div><div class="tiny-label">Spot price</div><div class="mono deriv-spot" id="dv-spot">—</div></div>
+      <div class="segmented" id="dv-tabs">
+        <button type="button" data-tab="options" class="${D.tab === "options" ? "active" : ""}">Options</button>
+        <button type="button" data-tab="futures" class="${D.tab === "futures" ? "active" : ""}">Futures</button>
+      </div>
+    </div>
+    <div class="deriv-layout">
+      <div class="card" id="dv-main"><div class="empty-state">Loading…</div></div>
+      <div class="card" id="dv-ticket"></div>
+    </div>
+    <div class="card" id="dv-positions" style="margin-top:16px;"><div class="empty-state">Loading positions…</div></div>
+  </div>`;
+
+  $("#dv-under").addEventListener("change", e => { D.symbol = e.target.value; D.sel = null; loadDerivMain(); });
+  $("#dv-tabs").querySelectorAll("[data-tab]").forEach(b => b.addEventListener("click", () => {
+    D.tab = b.dataset.tab;
+    $("#dv-tabs").querySelectorAll("[data-tab]").forEach(x => x.classList.toggle("active", x === b));
+    loadDerivMain();
+  }));
+  loadDerivMain();
+  loadDerivPositions();
+}
+
+async function loadDerivMain() {
+  const D = State.deriv;
+  if (D.tab === "options") {
+    try {
+      D.chain = await API.get(`/api/derivatives/chain?symbol=${encodeURIComponent(D.symbol)}${D.expiry ? `&expiry=${D.expiry}` : ""}`);
+    } catch { $("#dv-main").innerHTML = `<div class="empty-state">Option chain unavailable.</div>`; return; }
+    D.expiry = D.chain.expiry;
+    $("#dv-spot").textContent = fmtEur(D.chain.spot, 2);
+    if (!D.sel || !D.chain.rows.some(r => r.strike === D.sel.strike)) {
+      const atm = D.chain.rows.reduce((a, r) => Math.abs(r.strike - D.chain.spot) < Math.abs(a.strike - D.chain.spot) ? r : a);
+      D.sel = { type: "call", strike: atm.strike };
+    }
+    drawChain();
+    drawOptionTicket();
+  } else {
+    drawFuturesMain();
+    drawFutureTicket();
+  }
+}
+
+function drawChain() {
+  const D = State.deriv, c = D.chain;
+  const cell = (type, r) => {
+    const g = r[type];
+    const active = D.sel.type === type && D.sel.strike === r.strike;
+    const itm = type === "call" ? c.spot > r.strike : c.spot < r.strike;
+    return `<td class="chain-cell ${active ? "active" : ""} ${itm ? "itm" : ""}" data-type="${type}" data-strike="${r.strike}">
+      <div class="mono">${fmtEur(g.price, 2)}</div><div class="chain-delta">Δ ${fmtNum(g.delta, 2)}</div></td>`;
+  };
+  $("#dv-main").innerHTML = `
+    <div class="card-title">Option chain · ${esc(c.underlying)}
+      <div class="segmented" id="dv-exp">${c.expiries.map(e =>
+        `<button type="button" data-exp="${e}" class="${e === c.expiry ? "active" : ""}">${new Date(e + "T12:00:00Z").toLocaleDateString("en-US", { month: "short", day: "numeric" })}</button>`).join("")}</div>
+    </div>
+    <div class="deriv-note">${c.daysToExpiry} days to expiry · implied volatility ${(c.impliedVol * 100).toFixed(0)}% · risk-free rate ${(c.riskFree * 100).toFixed(0)}% · 1 contract = ${c.multiplier} ${c.multiplier === 1 ? "unit" : "units"}. Prices are per unit, from Black-Scholes. Shaded cells are in the money.</div>
+    <table class="holdings-table chain-table">
+      <thead><tr><th style="text-align:center;">Call</th><th style="text-align:center;">Strike</th><th style="text-align:center;">Put</th></tr></thead>
+      <tbody>${c.rows.map(r => `<tr>${cell("call", r)}<td class="chain-strike mono">${fmtNum(r.strike, r.strike < 10 ? 2 : 0)}</td>${cell("put", r)}</tr>`).join("")}</tbody>
+    </table>`;
+  $("#dv-exp").querySelectorAll("[data-exp]").forEach(b => b.addEventListener("click", () => { D.expiry = b.dataset.exp; loadDerivMain(); }));
+  $("#dv-main").querySelectorAll(".chain-cell").forEach(td => td.addEventListener("click", () => {
+    D.sel = { type: td.dataset.type, strike: +td.dataset.strike };
+    drawChain(); drawOptionTicket();
+  }));
+}
+
+function payoffSvg(points, { spot, breakeven, marker }) {
+  const w = 300, h = 150, pad = 8;
+  const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  const yMin = Math.min(...ys, 0), yMax = Math.max(...ys, 0);
+  const span = (yMax - yMin) || 1;
+  const X = x => pad + (x - x0) / (x1 - x0) * (w - 2 * pad);
+  const Y = y => pad + (yMax - y) / span * (h - 2 * pad);
+  const path = points.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join("");
+  const zero = Y(0);
+  const vline = (x, color, dash) => x >= x0 && x <= x1
+    ? `<line x1="${X(x)}" x2="${X(x)}" y1="${pad}" y2="${h - pad}" stroke="${color}" stroke-width="1" ${dash ? `stroke-dasharray="3 3"` : ""}/>` : "";
+  return `<svg viewBox="0 0 ${w} ${h}" class="payoff-svg" role="img" aria-label="Profit and loss at expiry">
+    <defs><clipPath id="pf-up"><rect x="0" y="0" width="${w}" height="${zero}"/></clipPath>
+    <clipPath id="pf-down"><rect x="0" y="${zero}" width="${w}" height="${h - zero}"/></clipPath></defs>
+    <line x1="${pad}" x2="${w - pad}" y1="${zero}" y2="${zero}" stroke="var(--border)" stroke-width="1"/>
+    ${vline(spot, "var(--text-tertiary)", true)}
+    ${breakeven ? vline(breakeven, "var(--accent)", true) : ""}
+    ${marker ? vline(marker, "var(--negative)", true) : ""}
+    <path d="${path}" fill="none" stroke="var(--positive)" stroke-width="2" clip-path="url(#pf-up)"/>
+    <path d="${path}" fill="none" stroke="var(--negative)" stroke-width="2" clip-path="url(#pf-down)"/>
+  </svg>`;
+}
+
+function drawOptionTicket() {
+  const D = State.deriv, c = D.chain;
+  const row = c.rows.find(r => r.strike === D.sel.strike);
+  const g = row[D.sel.type];
+  const n = Math.max(1, Math.round(D.contracts || 1));
+  const units = c.multiplier * n;
+  const cost = g.price * units;
+  const be = D.sel.type === "call" ? D.sel.strike + g.price : D.sel.strike - g.price;
+  const pts = [];
+  for (let i = 0; i <= 60; i++) {
+    const S = c.spot * (0.7 + i * 0.01);
+    const intrinsic = Math.max(D.sel.type === "call" ? S - D.sel.strike : D.sel.strike - S, 0);
+    pts.push([S, (intrinsic - g.price) * units]);
+  }
+  const up10 = Math.max(D.sel.type === "call" ? c.spot * 1.1 - D.sel.strike : D.sel.strike - c.spot * 1.1, 0);
+  const dn10 = Math.max(D.sel.type === "call" ? c.spot * 0.9 - D.sel.strike : D.sel.strike - c.spot * 0.9, 0);
+  $("#dv-ticket").innerHTML = `
+    <div class="card-title">Buy ${D.sel.type === "call" ? "a call" : "a put"}</div>
+    <div class="deriv-headline">${esc(c.underlying)} <b>${fmtNum(D.sel.strike, D.sel.strike < 10 ? 2 : 0)} ${D.sel.type.toUpperCase()}</b> · ${esc(c.expiry)}</div>
+    <div class="deriv-note">${D.sel.type === "call"
+      ? `The right to buy ${c.multiplier} ${esc(c.underlying)} at ${fmtEur(D.sel.strike, 2)} on expiry. You profit if the price ends above ${fmtEur(be, 2)}.`
+      : `The right to sell ${c.multiplier} ${esc(c.underlying)} at ${fmtEur(D.sel.strike, 2)} on expiry. You profit if the price ends below ${fmtEur(be, 2)}: a put works like insurance against a drop.`}</div>
+    <div class="field"><label>Contracts</label><input id="dv-n" type="number" min="1" step="1" value="${n}"></div>
+    <div class="deriv-grid">
+      <div><div class="tiny-label">Premium / unit</div><div class="mono">${fmtEur(g.price, 2)}</div></div>
+      <div><div class="tiny-label">Total cost</div><div class="mono"><b>${fmtEur(cost, 2)}</b></div></div>
+      <div><div class="tiny-label">Break-even</div><div class="mono">${fmtEur(be, 2)}</div></div>
+      <div><div class="tiny-label">Max loss</div><div class="mono" style="color:var(--negative)">${fmtEur(cost, 2)}</div></div>
+    </div>
+    <div class="card-title" style="margin-top:14px;font-size:11px;">Greeks (whole position)</div>
+    <div class="deriv-grid greeks">
+      <div title="Change in value for a $1 move in the underlying"><div class="tiny-label">Delta</div><div class="mono">${signed(g.delta * units, 2)}</div></div>
+      <div title="Change in delta for a $1 move"><div class="tiny-label">Gamma</div><div class="mono">${fmtNum(g.gamma * units, 3)}</div></div>
+      <div title="Value lost per day from time decay"><div class="tiny-label">Theta / day</div><div class="mono">${signed(g.theta * units, 2)}</div></div>
+      <div title="Change in value for +1 point of volatility"><div class="tiny-label">Vega</div><div class="mono">${signed(g.vega * units, 2)}</div></div>
+    </div>
+    <div class="card-title" style="margin-top:14px;font-size:11px;">Profit / loss at expiry</div>
+    ${payoffSvg(pts, { spot: c.spot, breakeven: be })}
+    <div class="deriv-note">If ${esc(c.underlying)} ends 10% higher: ${signed((up10 - g.price) * units)} · 10% lower: ${signed((dn10 - g.price) * units)}. Dotted lines: today's price (grey) and break-even (gold).</div>
+    <button class="btn-primary" id="dv-buy" type="button" style="margin-top:12px;">Buy ${n} contract${n > 1 ? "s" : ""} · ${fmtEur(cost, 2)}</button>`;
+  $("#dv-n").addEventListener("change", e => { D.contracts = Math.max(1, Math.round(+e.target.value || 1)); drawOptionTicket(); });
+  $("#dv-buy").addEventListener("click", () => submitOption({
+    underlying: c.underlying, type: D.sel.type, strike: D.sel.strike, expiry: c.expiry, contracts: n, side: "buy",
+  }));
+}
+
+async function submitOption(order, { skipConfirm = false } = {}) {
+  if (!skipConfirm) {
+    const ok = await confirmModal({
+      title: order.side === "buy" ? "Confirm option purchase" : "Confirm option sale",
+      body: `${order.side === "buy" ? "Buy" : "Sell"} <b>${order.contracts} × ${esc(order.underlying)} ${order.strike} ${order.type.toUpperCase()}</b> expiring ${esc(order.expiry)}, at the Black-Scholes price at the time of the order.`,
+    });
+    if (!ok) return null;
+  }
+  try {
+    const res = await API.post("/api/derivatives/options/order", order);
+    toast(`Option ${order.side === "buy" ? "bought" : "sold"}: ${res.contracts} × ${res.underlying} ${res.strike}${res.type === "call" ? "C" : "P"} for ${fmtEur(res.estimatedTotal, 2)} ✓`, "success");
+    await refreshPortfolio(); updateCashChip();
+    if (State.view === "derivatives") loadDerivPositions();
+    return res;
+  } catch (e) {
+    const map = { INSUFFICIENT_CASH: "Not enough cash for this premium.", INSUFFICIENT_CONTRACTS: "You don't hold that many contracts.", INVALID_EXPIRY: "This expiry is no longer available." };
+    toast(map[e.code] || "Order failed.", "error");
+    throw e;
+  }
+}
+
+function drawFuturesMain() {
+  const D = State.deriv;
+  const m = D.meta;
+  $("#dv-main").innerHTML = `
+    <div class="card-title">How a future works</div>
+    <div class="deriv-explain">
+      <p>A <b>future</b> is a commitment to buy (<b>long</b>) or sell (<b>short</b>) an asset at a fixed price on a future date. You don't pay the full price today: you lock a <b>margin</b> of ${(m.initialMargin * 100).toFixed(0)}% of the position's value, which gives you <b>${(1 / m.initialMargin).toFixed(0)}× leverage</b>.</p>
+      <p>Every move is <b>marked to market</b>: gains and losses hit your margin immediately. A 1% move in the underlying is a ${(1 / m.initialMargin).toFixed(0)}% move on your margin. If losses bring the margin down to ${(m.maintenanceMargin * 100).toFixed(0)}% of the position's value, the position is closed automatically: that's a <b>margin call</b>.</p>
+      <p>The futures price is slightly above spot: <span class="mono">F = S × e^(r·T)</span>, with r = ${(m.riskFree * 100).toFixed(0)}% (cost of carry). Shorting lets you profit from a fall, or hedge stocks you hold.</p>
+    </div>`;
+  API.post("/api/derivatives/futures/preview", { underlying: D.symbol, side: "long", qty: 1 })
+    .then(p => { $("#dv-spot").textContent = fmtEur(p.spot, 2); })
+    .catch(e => { if (e.status === 422) API.get(`/api/derivatives/chain?symbol=${encodeURIComponent(D.symbol)}`).then(c => { $("#dv-spot").textContent = fmtEur(c.spot, 2); }); });
+}
+
+async function drawFutureTicket() {
+  const D = State.deriv;
+  const el = $("#dv-ticket");
+  let p = null, err = null;
+  try { p = await API.post("/api/derivatives/futures/preview", { underlying: D.symbol, side: D.fSide, qty: D.fQty }); }
+  catch (e) { err = e.code; }
+  const pts = [];
+  if (p) {
+    for (let i = 0; i <= 60; i++) {
+      const S = p.futurePrice * (0.85 + i * 0.005);
+      pts.push([S, (S - p.futurePrice) * p.qty * (p.side === "long" ? 1 : -1)]);
+    }
+  }
+  el.innerHTML = `
+    <div class="card-title">Open a future</div>
+    <div class="segmented" id="dv-fside" style="margin-bottom:12px;">
+      <button type="button" data-side="long" class="${D.fSide === "long" ? "active" : ""}">Long (bet on a rise)</button>
+      <button type="button" data-side="short" class="${D.fSide === "short" ? "active" : ""}">Short (bet on a fall)</button>
+    </div>
+    <div class="field"><label>Quantity (units of ${esc(D.symbol)})</label><input id="dv-fq" type="number" min="0.0001" step="any" value="${D.fQty}"></div>
+    ${p ? `
+    <div class="deriv-grid">
+      <div><div class="tiny-label">Futures price</div><div class="mono">${fmtEur(p.futurePrice, 2)}</div></div>
+      <div><div class="tiny-label">Expiry</div><div class="mono">${esc(p.expiry)}</div></div>
+      <div><div class="tiny-label">Exposure</div><div class="mono">${fmtEur(p.notional, 2)}</div></div>
+      <div><div class="tiny-label">Margin locked</div><div class="mono"><b>${fmtEur(p.margin, 2)}</b></div></div>
+      <div><div class="tiny-label">Per 1% move</div><div class="mono">${signed(Math.abs(p.pnlPer1Pct), 2)} / −${fmtEur(Math.abs(p.pnlPer1Pct), 2)}</div></div>
+      <div><div class="tiny-label">Margin call at</div><div class="mono" style="color:var(--negative)">${fmtEur(p.liquidationPrice, 2)}</div></div>
+    </div>
+    <div class="card-title" style="margin-top:14px;font-size:11px;">Profit / loss vs. price</div>
+    ${payoffSvg(pts, { spot: p.futurePrice, marker: p.liquidationPrice })}
+    <div class="deriv-note">Red dotted line: the price that triggers the margin call (${(((p.liquidationPrice / p.futurePrice) - 1) * 100).toFixed(1)}% from today).</div>
+    <button class="btn-primary" id="dv-fopen" type="button" style="margin-top:12px;">Open ${p.side} · lock ${fmtEur(p.margin, 2)}</button>`
+    : `<div class="empty-state" style="padding:16px;">${err === "INSUFFICIENT_CASH" ? "Not enough cash for the margin on this size." : "Enter a quantity."}</div>`}`;
+  el.querySelectorAll("[data-side]").forEach(b => b.addEventListener("click", () => { D.fSide = b.dataset.side; drawFutureTicket(); }));
+  $("#dv-fq").addEventListener("change", e => { D.fQty = Math.max(0.0001, +e.target.value || 1); drawFutureTicket(); });
+  const open = $("#dv-fopen");
+  if (open) open.addEventListener("click", () => submitFuture({ underlying: D.symbol, side: D.fSide, qty: D.fQty }));
+}
+
+async function submitFuture(order, { skipConfirm = false } = {}) {
+  if (!skipConfirm) {
+    const ok = await confirmModal({
+      title: "Confirm futures position",
+      body: `Open a <b>${order.side}</b> future on <b>${fmtQty(order.qty)} ${esc(order.underlying)}</b>. The margin is taken from your cash; gains and losses are marked to market until you close it.`,
+      warning: "Leverage multiplies losses as much as gains.",
+    });
+    if (!ok) return null;
+  }
+  try {
+    const res = await API.post("/api/derivatives/futures/open", order);
+    toast(`Future opened: ${res.side} ${fmtQty(res.qty)} ${res.underlying} at ${fmtEur(res.futurePrice, 2)} ✓`, "success");
+    await refreshPortfolio(); updateCashChip();
+    if (State.view === "derivatives") { loadDerivPositions(); drawFutureTicket(); }
+    return res;
+  } catch (e) {
+    toast(e.code === "INSUFFICIENT_CASH" ? "Not enough cash for the margin." : "Order failed.", "error");
+    throw e;
+  }
+}
+
+async function loadDerivPositions() {
+  let d;
+  try { d = await API.get("/api/derivatives/positions"); } catch { return; }
+  const el = $("#dv-positions");
+  if (!el) return;
+  for (const ev of d.events || []) {
+    toast(ev.kind === "margin_call" ? `Margin call: your ${ev.label} was closed, ${fmtEur(ev.cashBack, 2)} returned.`
+      : `${ev.label} expired: ${fmtEur(ev.payout ?? ev.cashBack, 2)} credited.`, ev.kind === "margin_call" ? "error" : "success");
+  }
+  const pnl = n => `<span class="mono" style="color:${n >= 0 ? "var(--positive)" : "var(--negative)"}">${signed(n, 2)}</span>`;
+  el.innerHTML = `
+    <div class="card-title">My derivatives</div>
+    ${!d.options.length && !d.futures.length ? `<div class="empty-state" style="padding:18px;">No options or futures yet. Pick a strike in the chain or open a future above.</div>` : ""}
+    ${d.options.length ? `
+    <table class="holdings-table">
+      <thead><tr><th>Option</th><th>Contracts</th><th>Paid</th><th>Now</th><th>Value</th><th>P&L</th><th>Delta</th><th>Theta/day</th><th></th></tr></thead>
+      <tbody>${d.options.map(o => `<tr>
+        <td><b>${esc(o.label)}</b><div class="stock-ticker">${o.daysToExpiry} days left · spot ${fmtEur(o.spot, 2)}</div></td>
+        <td class="mono">${fmtQty(o.contracts)}</td>
+        <td class="mono">${fmtEur(o.avgPremium, 2)}</td>
+        <td class="mono">${fmtEur(o.price, 2)}</td>
+        <td class="mono">${fmtEur(o.value, 2)}</td>
+        <td>${pnl(o.pnl)}</td>
+        <td class="mono">${fmtNum(o.delta, 1)}</td>
+        <td class="mono">${signed(o.theta, 2)}</td>
+        <td><button class="filter-chip" type="button" data-sell-opt="${o.id}">Sell</button></td>
+      </tr>`).join("")}</tbody>
+    </table>` : ""}
+    ${d.futures.length ? `
+    <table class="holdings-table" style="margin-top:10px;">
+      <thead><tr><th>Future</th><th>Qty</th><th>Entry</th><th>Now</th><th>Margin</th><th>P&L</th><th>Leverage</th><th>Margin call at</th><th></th></tr></thead>
+      <tbody>${d.futures.map(f => `<tr>
+        <td><b>${f.side.toUpperCase()} ${esc(f.underlying)}</b><div class="stock-ticker">expires ${esc(f.expiry)}</div></td>
+        <td class="mono">${fmtQty(f.qty)}</td>
+        <td class="mono">${fmtEur(f.entryPrice, 2)}</td>
+        <td class="mono">${fmtEur(f.price, 2)}</td>
+        <td class="mono">${fmtEur(f.margin, 2)}</td>
+        <td>${pnl(f.pnl)}</td>
+        <td class="mono">${fmtNum(f.leverage, 1)}×</td>
+        <td class="mono" style="color:var(--negative)">${fmtEur(f.liquidationPrice, 2)}</td>
+        <td><button class="filter-chip" type="button" data-close-fut="${f.id}">Close</button></td>
+      </tr>`).join("")}</tbody>
+    </table>` : ""}`;
+  el.querySelectorAll("[data-sell-opt]").forEach(b => b.addEventListener("click", async () => {
+    const o = d.options.find(x => x.id === +b.dataset.sellOpt);
+    try { await submitOption({ underlying: o.underlying, type: o.type, strike: o.strike, expiry: o.expiry, contracts: o.contracts, side: "sell" }); } catch { /* toast shown */ }
+  }));
+  el.querySelectorAll("[data-close-fut]").forEach(b => b.addEventListener("click", async () => {
+    const ok = await confirmModal({ title: "Close future", body: "Close this position at the current futures price? Your margin plus or minus the P&L goes back to cash." });
+    if (!ok) return;
+    try {
+      const r = await API.post(`/api/derivatives/futures/${b.dataset.closeFut}/close`);
+      toast(`Future closed at ${fmtEur(r.closedAt, 2)}: ${signed(r.pnl, 2)}, ${fmtEur(r.cashBack, 2)} back to cash ✓`, r.pnl >= 0 ? "success" : "");
+      await refreshPortfolio(); updateCashChip(); loadDerivPositions();
+    } catch { toast("Couldn't close the position.", "error"); }
+  }));
+}
+
 /* ================================================================= NEWS = */
 function newsThumbHtml(n) {
   return n.image
@@ -1526,7 +1840,7 @@ async function renderAgent() {
         </div>
         <div class="chat-thread" id="chat-thread"></div>
         <div class="coach-prompts" id="coach-prompts">
-          ${["Analyse my portfolio", "How does my budget look?", "Explain today's news", "Buy 2 AAPL"].map(p =>
+          ${["Analyse my portfolio", "How does my budget look?", "Explain today's news", "Buy 2 AAPL", "Buy 1 AAPL 240 call", "Explain the Greeks"].map(p =>
             `<button class="filter-chip" type="button" data-prompt="${esc(p)}">${esc(p)}</button>`).join("")}
         </div>
         <div class="chat-input-row">
@@ -1726,22 +2040,45 @@ async function sendChat() {
 }
 
 /* Order proposals from the coach: nothing runs until the user clicks Confirm. */
+function proposalSummary(p) {
+  if (p.kind === "option") {
+    const verb = p.side === "buy" ? "Buy" : "Sell";
+    return {
+      tag: "Simulated option", positive: p.side === "buy",
+      main: `${verb} <b>${p.contracts} × ${esc(p.underlying)} ${p.strike} ${p.type.toUpperCase()}</b> <span class="muted">exp. ${esc(p.expiry)}</span>`,
+      sub: `premium ≈ ${fmtEur(p.premium, 2)} / unit × ${p.multiplier} · total ≈ <b>${fmtEur(p.estimatedTotal, 2)}</b> · break-even ${fmtEur(p.breakeven, 2)}`,
+    };
+  }
+  if (p.kind === "future") {
+    return {
+      tag: "Simulated future", positive: p.side === "long",
+      main: `${p.side === "long" ? "Long" : "Short"} <b>${fmtQty(p.qty)} ${esc(p.underlying)}</b> future <span class="muted">exp. ${esc(p.expiry)}</span>`,
+      sub: `at ≈ ${fmtEur(p.futurePrice, 2)} · exposure ${fmtEur(p.notional, 2)} · margin <b>${fmtEur(p.margin, 2)}</b> · margin call at ${fmtEur(p.liquidationPrice, 2)}`,
+    };
+  }
+  return {
+    tag: "Simulated order", positive: p.side === "buy",
+    main: `${p.side === "buy" ? "Buy" : "Sell"} <b>${fmtQty(p.qty)} × ${esc(p.symbol)}</b> <span class="muted">${esc(p.name || "")}</span>`,
+    sub: `≈ ${fmtEur(p.estimatedPrice, 2)} / share · total ≈ <b>${fmtEur(p.estimatedTotal, 2)}</b> · cash after ≈ ${fmtEur(p.cashAfter, 2)}`,
+  };
+}
+
 function proposalCardHtml(p, i, j) {
-  const verb = p.side === "buy" ? "Buy" : "Sell";
+  const sum = proposalSummary(p);
   const status = {
     pending: `<div class="proposal-actions">
         <button class="btn-primary" type="button" data-proposal="${i}:${j}" data-action="confirm">Confirm order</button>
         <button class="btn-ghost" type="button" data-proposal="${i}:${j}" data-action="cancel">Cancel</button>
       </div>`,
     running: `<div class="proposal-status">Placing order…</div>`,
-    done: `<div class="proposal-status ok">✓ Executed at ${fmtEur(p.executedPrice ?? p.estimatedPrice, 2)}</div>`,
+    done: `<div class="proposal-status ok">✓ Executed${p.executedPrice != null ? ` at ${fmtEur(p.executedPrice, 2)}` : ""}</div>`,
     cancelled: `<div class="proposal-status">Cancelled</div>`,
     failed: `<div class="proposal-status err">✗ ${esc(p.error || "Order failed")}</div>`,
   }[p.status] || "";
   return `<div class="proposal-card">
-    <div class="proposal-head"><span class="tag ${p.side === "buy" ? "positive" : "negative"}">Simulated order</span></div>
-    <div class="proposal-main">${verb} <b>${fmtQty(p.qty)} × ${esc(p.symbol)}</b> <span class="muted">${esc(p.name || "")}</span></div>
-    <div class="proposal-sub">≈ ${fmtEur(p.estimatedPrice, 2)} / share · total ≈ <b>${fmtEur(p.estimatedTotal, 2)}</b> · cash after ≈ ${fmtEur(p.cashAfter, 2)}</div>
+    <div class="proposal-head"><span class="tag ${sum.positive ? "positive" : "negative"}">${sum.tag}</span></div>
+    <div class="proposal-main">${sum.main}</div>
+    <div class="proposal-sub">${sum.sub}</div>
     ${p.reason ? `<div class="proposal-reason">${esc(p.reason)}</div>` : ""}
     ${status}
   </div>`;
@@ -1756,14 +2093,22 @@ async function onProposalClick(e) {
   if (btn.dataset.action === "cancel") { p.status = "cancelled"; drawChat(); return; }
   p.status = "running"; drawChat();
   try {
-    const res = await API.post("/api/portfolio/order", { symbol: p.symbol, side: p.side, qty: p.qty });
-    p.status = "done"; p.executedPrice = res.executedPrice;
-    await refreshPortfolio();
-    State.newsCache = {};
-    State.insights = null;
-    toast(`Order executed: ${fmtQty(res.qty ?? p.qty)} × ${p.symbol} at ${fmtEur(res.executedPrice, 2)} ✓`, "success");
+    if (p.kind === "option") {
+      await submitOption({ underlying: p.underlying, type: p.type, strike: p.strike, expiry: p.expiry, contracts: p.contracts, side: p.side }, { skipConfirm: true });
+      p.status = "done";
+    } else if (p.kind === "future") {
+      const res = await submitFuture({ underlying: p.underlying, side: p.side, qty: p.qty }, { skipConfirm: true });
+      p.status = "done"; p.executedPrice = res.futurePrice;
+    } else {
+      const res = await API.post("/api/portfolio/order", { symbol: p.symbol, side: p.side, qty: p.qty });
+      p.status = "done"; p.executedPrice = res.executedPrice;
+      await refreshPortfolio();
+      State.newsCache = {};
+      State.insights = null;
+      toast(`Order executed: ${fmtQty(res.qty ?? p.qty)} × ${p.symbol} at ${fmtEur(res.executedPrice, 2)} ✓`, "success");
+    }
   } catch (err) {
-    const map = { INSUFFICIENT_CASH: "Not enough cash", INSUFFICIENT_SHARES: "Not enough shares", SYMBOL_NOT_FOUND: "Unknown ticker" };
+    const map = { INSUFFICIENT_CASH: "Not enough cash", INSUFFICIENT_SHARES: "Not enough shares", INSUFFICIENT_CONTRACTS: "Not enough contracts", SYMBOL_NOT_FOUND: "Unknown ticker" };
     p.status = "failed"; p.error = map[err.code] || "Order failed";
   }
   drawChat();

@@ -13,6 +13,7 @@ import marketRoutes from "./routes/market.js";
 import miscRoutes from "./routes/misc.js";
 import accountRoutes from "./routes/account.js";
 import adminRoutes from "./routes/admin.js";
+import derivativesRoutes from "./routes/derivatives.js";
 import { DEMO_MODE } from "./services/market.js";
 import { coachEnabled, COACH_MODEL } from "./services/coach.js";
 
@@ -62,6 +63,7 @@ app.use("/api/portfolio", portfolioRoutes);
 app.use("/api/market", marketRoutes);
 app.use("/api/account", accountRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/derivatives", derivativesRoutes);
 app.use("/api", miscRoutes);
 
 app.use(express.static(PUBLIC_DIR));
@@ -86,7 +88,7 @@ const server = app.listen(PORT, () => {
     ? "⚠ DEMO MODE: no FINNHUB_API_KEY set — simulated market data & news."
     : "✓ Live market data via Finnhub." + (process.env.TWELVEDATA_API_KEY ? " + Twelve Data (Europe/Asia)." : ""));
   console.log(coachEnabled()
-    ? `✓ AI coach powered by Claude (${COACH_MODEL}).`
+    ? `✓ AI coach enabled (${COACH_MODEL}).`
     : "⚠ No ANTHROPIC_API_KEY — coach running in demo (rules) mode.");
 });
 
