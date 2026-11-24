@@ -2,7 +2,7 @@
 
 **Learn to invest without risking a cent.** Finwise is a portfolio simulator for students and young people: virtual money, real market prices, a budget planner, and an AI coach that analyses your portfolio and budget, explains the news, and prepares simulated orders you confirm in one click.
 
-**Live demo:** _link coming soon_ · click **Try the live demo** to land on a pre-filled account, no sign-up needed.
+**Live demo: [finwise-2h94.onrender.com](https://finwise-2h94.onrender.com)** · click **Try the live demo** to land on a pre-filled account, no sign-up needed. (Free hosting: the first visit after a quiet period can take about 50 seconds to wake up.)
 
 ![Dashboard](docs/screenshots/dashboard.png)
 
