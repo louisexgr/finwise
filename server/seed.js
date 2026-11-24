@@ -10,6 +10,7 @@ import db, {
   upsertBudget, upsertPlan, insertDeposit, runOrderTx,
 } from "./db.js";
 import { KNOWN_ASSETS } from "./services/market.js";
+import { blackScholes, contractMultiplier, impliedVol, listExpiries, yearsTo } from "./services/derivatives.js";
 
 export const DEMO_EMAIL = (process.env.DEMO_EMAIL || "demo@finwise.app").toLowerCase();
 export const DEMO_PASSWORD = process.env.DEMO_PASSWORD || "finwise-demo";
@@ -58,6 +59,18 @@ export function seedDemoAccount() {
       name: meta.name, sector: meta.sector, country: meta.country, assetClass: meta.class,
     });
   }
+
+  // A protective put on the most volatile holding, to show options in action.
+  const nvda = KNOWN_ASSETS.find(a => a.symbol === "NVDA");
+  const expiry = listExpiries()[2];
+  const strike = Math.round((nvda.base * 0.93) / 5) * 5;
+  const premium = +blackScholes("put", nvda.base, strike, yearsTo(expiry), impliedVol("NVDA", "stock")).price.toFixed(2);
+  const mult = contractMultiplier(nvda.base);
+  updateCash.run(-+(premium * mult).toFixed(2), id);
+  db.prepare(`INSERT INTO option_positions (user_id, underlying, type, strike, expiry, multiplier, contracts, avg_premium)
+              VALUES (?, 'NVDA', 'put', ?, ?, ?, 1, ?)`).run(id, strike, expiry, mult, premium);
+  db.prepare("INSERT INTO transactions (user_id, symbol, side, qty, price, total, created_at) VALUES (?, ?, 'buy', 1, ?, ?, datetime('now', '-10 days'))")
+    .run(id, `NVDA ${strike}P ${expiry}`, premium, +(premium * mult).toFixed(2));
 
   // Spread the history over the last months so it reads like a real journey.
   const txs = db.prepare("SELECT id, symbol FROM transactions WHERE user_id = ? ORDER BY id").all(id);
